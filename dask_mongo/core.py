@@ -11,6 +11,7 @@ from copy import copy
 from functools import lru_cache
 from math import ceil
 from typing import Any
+import tqdm
 
 import pymongo
 from bson import ObjectId
@@ -145,6 +146,8 @@ def read_mongo(
     *,
     connection_kwargs: dict[str, Any] = None,
     match: dict[str, Any] = None,
+    use_estimated_count: bool = False,
+    paginate_partition_ids: bool = False,
 ):
     """Read data from a Mongo database into a Dask Bag.
 
@@ -170,28 +173,46 @@ def read_mongo(
     mongo_client = _get_client(connection_kwargs)
     coll = mongo_client[database][collection]
 
-    nrows = next(
-        (
-            coll.aggregate(
-                [
-                    {"$match": match},
-                    {"$count": "count"},
-                ]
+    if use_estimated_count:
+        nrows = coll.estimated_document_count()
+    else:
+        nrows = next(
+            (
+                coll.aggregate(
+                    [
+                        {"$match": match},
+                        {"$count": "count"},
+                    ]
+                )
             )
-        )
-    )["count"]
+        )["count"]
 
     npartitions = int(ceil(nrows / chunksize))
 
-    partitions_ids = list(
-        coll.aggregate(
-            [
-                {"$match": match},
-                {"$bucketAuto": {"groupBy": "$_id", "buckets": npartitions}},
-            ],
-            allowDiskUse=True,
+    partitions_ids = []
+    if paginate_partition_ids:
+        cursor = coll.find(match, {"_id": 1}).sort("_id", 1)
+        prev_id = coll.find_one(sort=[("_id", 1)])["_id"]
+        for idx, doc in tqdm.tqdm(enumerate(cursor), total=nrows):
+            if idx >= nrows:
+                break
+            if idx % chunksize == 0 and idx > 0:
+                current_id = doc["_id"]
+                partitions_ids.append({"_id": {"min": prev_id, "max": current_id}})
+                prev_id = current_id
+        if prev_id:
+            max_id = doc["_id"]
+            partitions_ids.append({"_id": {"min": prev_id, "max": max_id}})
+    else:
+        partitions_ids = list(
+            coll.aggregate(
+                [
+                    {"$match": match},
+                    {"$bucketAuto": {"groupBy": "$_id", "buckets": npartitions}},
+                ],
+                allowDiskUse=True,
+            )
         )
-    )
 
     common_args = (connection_kwargs, database, collection, match)
     name = "read_mongo-" + tokenize(common_args, chunksize)
